@@ -2,11 +2,11 @@ Gem::Specification.new do |s|
   s.name          = 'logstash-input-zendesk'
   s.version       = '0.1.0'
   s.licenses      = ['Apache-2.0']
-  s.summary       = 'TODO: Write a short summary, because Rubygems requires one.'
-  s.description   = '{TODO: Write a longer description or delete this line.'
-  s.homepage      = 'TODO: Put your plugin''s website or public repo URL here.'
-  s.authors       = ['']
-  s.email         = ''
+  s.summary       = 'Zendesk input plugin for Logstash'
+  s.description   = 'This gem together with Logstash provides an input pipe from Zendesk into Elasticsearch to insert Zendesk tickets details, comments and other Zendesk info into the Elasticsearch indexes.'
+  s.homepage      = 'https://github.com/sejba/logstash-input-zendesk'
+  s.authors       = ['ppf2','Jakub Sejba']
+  s.email         = 'sejba@jsejba.cz'
   s.require_paths = ['lib']
 
   # Files
@@ -21,5 +21,6 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency "logstash-core-plugin-api", "~> 2.0"
   s.add_runtime_dependency 'logstash-codec-plain'
   s.add_runtime_dependency 'stud', '>= 0.0.22'
+  s.add_runtime_dependency 'zendesk_api', '>= 1.27.0'
   s.add_development_dependency 'logstash-devutils', '>= 0.0.16'
 end

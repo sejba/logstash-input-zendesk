@@ -3,8 +3,6 @@ require "logstash/inputs/base"
 require "stud/interval"
 require 'zendesk_api'
 
-# @TODO: Add the plugin description
-
 class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   config_name "zendesk"
   default :codec, "json"
@@ -41,6 +39,9 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   # This is the sleep time (minutes) between plugin runs. Does not apply when tickets_last_updated_n_days_ago => -1.
   config :interval, :validate => :number, :default => 1
 
+  # Add ticket field names and IDs to the log file? (for dev/config purposes)
+  config :log_ticket_fields, :validate => :boolean, :default => false
+
 # To avoid :exception=>#<RuntimeError: LogStash::Inputs::Zendesk#register must be overidden> 
   public
   def register
@@ -75,8 +76,68 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
 
   private
   def get_tickets(queue, last_updated_n_days, get_comments)
-    ticket = ZendeskAPI::Ticket.find!(@zd_client, :id => 16238)
-    puts "Ticket priority: "+ticket.priority
+    begin
+      @ticketfields = Hash.new
+      ticket_fields = @zd_client.ticket_fields
+      ticket_fields.each do |tf|
+        @ticketfields["field_#{tf.id}"] = tf.title.downcase.gsub(' ', '_')
+	if @log_ticket_fields
+	  @logger.info("Ticket field: " + tf.title.downcase.gsub(' ', '_'), :field_id => tf.id)
+	end
+      end
+      if last_updated_n_days != -1
+        start_time = Time.now.to_i - (86400 * last_updated_n_days)
+      else
+        start_time = 0
+      end
+      @logger.info("Processing tickets...", :start_time => start_time)
+      tickets = ZendeskAPI::Ticket.incremental_export(@zd_client, start_time)
+      next_page_from_each = ""
+      next_page_from_next = ""
+      count = 0
+      next_page = true
+      while next_page && tickets.count > 0
+        @logger.info("Next page from Zendesk api", :next_page_url => tickets.instance_variable_get("@next_page"))
+        @logger.info("Number of tickets returned from current incremental export page request", :count => tickets.count)
+        tickets.each do |ticket|
+          next_page_from_each = tickets.instance_variable_get("@next_page")
+          if ticket.status == 'Deleted'
+            # Do nothing, previously deleted tickets will show up in incremental export, but does not make sense to fetch
+            @logger.info("Skipping previously deleted ticket", :ticket_id => ticket.id)
+          else
+            count = count + 1
+            @logger.info("Ticket", :id => ticket.id, :progress => "#{count}/#{tickets.count}")
+            #process_ticket(output_queue,ticket,get_comments)
+            @logger.info("Done processing ticket", :id => ticket.id)
+          end #end Deleted status check
+        end # end ticket loop
+        tickets.next
+        next_page_from_next = tickets.instance_variable_get("@next_page")
+        # Zendesk api creates a next page attribute in its incremental export response including a generated
+        # start_time for the "next page" request.  Occasionally, it generates
+        # the next page request with the same start_time as the originating request.
+        # When this happens, it will keep requesting the same page over and over again.  Added a check to workaround this
+        # behavior.
+        if next_page_from_next == next_page_from_each
+          next_page = false
+        end
+        count = 0
+      end # end while
+    # Zendesk api generates the start_time for the next page request.
+    # If it ends up generating a start time that is within 5 minutes from now, it will return the following message
+    # instead of a regular json response:
+    # "Too recent start_time. Use a start_time older than 5 minutes".
+    # This is added to ignore the message and treat it as benign.
+    rescue => e
+      if e.message.index 'Too recent start_time'
+      # Do nothing for "Too recent start_time. Use a start_time older than 5 minutes" message returned by Zendesk api
+      # This simply means that there are no more pages to fetch
+        next_page = false
+      else
+        @logger.error(e.message, :method => "get_tickets", :trace => e.backtrace)
+      end
+    end
+    @logger.info("Done processing tickets.")
   end # def get_tickets
 
   public

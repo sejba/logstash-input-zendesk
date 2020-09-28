@@ -27,16 +27,24 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   # Whether or not to fetch ticket comments (certainly, you can only fetch comments if you are fetching tickets).
   config :comments, :validate => :boolean, :default => false
 
-  # This is the criteria for fetching tickets in the form of last updated N days ago.
-  # Updated tickets include new tickets.
-  #   Examples:
-  #     0.5 = updated in the past 12 hours
-  #     1  = updated in the past day
-  #     7 = updated in the past week
-  #     -1 = get all tickets (when this mode is chosen, the plugin will run only once, not continuously)
-  config :tickets_last_updated_n_days_ago, :validate => :number, :default => 1
+  # This parameter determines the "start_time" value for Zendesk incremental exports.
+  # The workflow is as follows:
+  # 	1. Try to identify last fetched time (i.e. "end_time" return value from Zendesk incremental backup) @TODO - where is it saved?
+  # 	2a. If there's any last fetched time, the plugin will use it as a new start_time, i.e. only the previously unfetched date will be exported.
+  # 	2b. If there's no last fetched time use this parameter (i.e. start_n_days_ago).
+  # 		2b.1. if the default values (-1) is used, the plugin will set start_time=0, i.e. it will export all your Zendesk tickets (this should be executed only once)
+  #		2b.2. if the value <> -1 the plugin will calculate the start_time as now() minus the given number of days and then will export the data using this starting time.
+  #		      From this point on it will again use end_time as a new start_time for another execution.
+  # 	If the default value (-1) is used the plugin will:
+  #
+  # Examples:
+  # 	Use default to get all the tickets on a first run and then just a new updates on every other iteration.
+  #     Use 365 to get all the tickets from the last year and the just a new updates on every other iteration.
+  #
+  #In other words the parameter is only useful for the very first iteration.
+  config :start_n_days_ago, :validate => :number, :default => -1
 
-  # This is the sleep time (minutes) between plugin runs. Does not apply when tickets_last_updated_n_days_ago => -1.
+  # This is the sleep time (minutes) between plugin runs.
   config :interval, :validate => :number, :default => 1
 
   # Add ticket field names and IDs to the log file? (for dev/config purposes)
@@ -75,54 +83,48 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   end # def zendesk_client
 
   private
-  def get_tickets(queue, last_updated_n_days, get_comments)
+  def get_start_time(start_n_days_ago)
+    if @fetch_end_time
+      return @fetch_end_time
+    elsif start_n_days_ago == -1
+      return 0
+    else
+      return (Time.now.to_i - (86400 * start_n_days_ago))
+    end
+  end # get_start_time
+
+  private
+  def get_tickets(queue, start_time)
     begin
-      @ticketfields = Hash.new
-      ticket_fields = @zd_client.ticket_fields
-      ticket_fields.each do |tf|
-        @ticketfields["field_#{tf.id}"] = tf.title.downcase.gsub(' ', '_')
-	if @log_ticket_fields
-	  @logger.info("Ticket field: " + tf.title.downcase.gsub(' ', '_'), :field_id => tf.id)
-	end
-      end
-      if last_updated_n_days != -1
-        start_time = Time.now.to_i - (86400 * last_updated_n_days)
-      else
-        start_time = 0
-      end
-      @logger.info("Processing tickets...", :start_time => start_time)
-      tickets = ZendeskAPI::Ticket.incremental_export(@zd_client, start_time)
-      next_page_from_each = ""
-      next_page_from_next = ""
-      count = 0
-      next_page = true
-      while next_page && tickets.count > 0
-        @logger.info("Next page from Zendesk api", :next_page_url => tickets.instance_variable_get("@next_page"))
-        @logger.info("Number of tickets returned from current incremental export page request", :count => tickets.count)
+      get_ticket_fields
+      @logger.info("Processing tickets...")
+
+      end_of_stream = false
+      page_count = 0
+      until end_of_stream # page loop
+        tickets = ZendeskAPI::Ticket.incremental_export(@zd_client, start_time)
+	page_count += 1
+	count = 0
+	@logger.info("   Processing page #{page_count}, tickets count = #{tickets.count}", :start_time => start_time)
+
         tickets.each do |ticket|
-          next_page_from_each = tickets.instance_variable_get("@next_page")
           if ticket.status == 'Deleted'
             # Do nothing, previously deleted tickets will show up in incremental export, but does not make sense to fetch
-            @logger.info("Skipping previously deleted ticket", :ticket_id => ticket.id)
+            @logger.info("      Skipping previously deleted ticket", :ticket_id => ticket.id)
           else
             count = count + 1
-            @logger.info("Ticket", :id => ticket.id, :progress => "#{count}/#{tickets.count}")
+            @logger.info("      Ticket", :id => ticket.id, :progress => "#{count}/#{tickets.count}")
             #process_ticket(output_queue,ticket,get_comments)
-            @logger.info("Done processing ticket", :id => ticket.id)
+            @logger.info("      Done processing ticket", :id => ticket.id)
           end #end Deleted status check
         end # end ticket loop
-        tickets.next
-        next_page_from_next = tickets.instance_variable_get("@next_page")
-        # Zendesk api creates a next page attribute in its incremental export response including a generated
-        # start_time for the "next page" request.  Occasionally, it generates
-        # the next page request with the same start_time as the originating request.
-        # When this happens, it will keep requesting the same page over and over again.  Added a check to workaround this
-        # behavior.
-        if next_page_from_next == next_page_from_each
-          next_page = false
-        end
-        count = 0
-      end # end while
+
+	end_of_stream = tickets.included["end_of_stream"]
+	start_time = tickets.included["end_time"] # this is the start time for the next page
+      end # end until, i.e. page loop
+
+      @fetch_end_time = start_time # i.e. end_time from the last page
+
     # Zendesk api generates the start_time for the next page request.
     # If it ends up generating a start time that is within 5 minutes from now, it will return the following message
     # instead of a regular json response:
@@ -137,8 +139,20 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
         @logger.error(e.message, :method => "get_tickets", :trace => e.backtrace)
       end
     end
-    @logger.info("Done processing tickets.")
+    @logger.info("Done processing tickets. Start time saved for the next iteration = #{@fetch_end_time}")
   end # def get_tickets
+
+  private
+  def get_ticket_fields()
+    @ticketfields = Hash.new
+    ticket_fields = @zd_client.ticket_fields
+    ticket_fields.each do |tf|
+      @ticketfields["field_#{tf.id}"] = tf.title.downcase.gsub(' ', '_')
+      if @log_ticket_fields
+         @logger.info("Ticket field: " + tf.title.downcase.gsub(' ', '_'), :field_id => tf.id)
+      end
+    end
+  end # get_ticket_fields
 
   public
   def run(queue)
@@ -147,14 +161,14 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
       start = Time.now
       @logger.info("Starting Zendesk input run.", :start_time => start)
       puts "Starting Zendesk input run: " + start.to_s
+
       zendesk_client
-      @tickets ? get_tickets(queue, @tickets_last_updated_n_days_ago, @comments) : nil
+      start_time = get_start_time(@start_n_days_ago)
+      @tickets ? get_tickets(queue, start_time) : nil
+
       @logger.info("Completed in (minutes).", :duration => ((Time.now - start)/60).round(2))
       puts "Completed in: " + (((Time.now - start)/60).round(2)).to_s
       @zd_client = nil
-      if @tickets_last_updated_n_days_ago == -1
-        break
-      end
       @logger.info("Sleeping before next run ...", :minutes => @interval)
       # because the sleep interval can be big, when shutdown happens we want to be able to abort the sleep.
       # Stud.stoppable_sleep will frequently evaluate the given block and abort the sleep(@interval) if the return value is true

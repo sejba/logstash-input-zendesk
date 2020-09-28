@@ -47,8 +47,10 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   # This is the sleep time (minutes) between plugin runs.
   config :interval, :validate => :number, :default => 1
 
-  # Add ticket field names and IDs to the log file? (for dev/config purposes)
-  config :log_ticket_fields, :validate => :boolean, :default => false
+  ############################################################################
+  @@include_ticket_attributes = Set["id", "created_at", "updated_at", "subject", "description", "priority", "status", "requester_id", "submitter_id", "assignee_id", "organization_id", "tags"]
+  @@include_ticket_custom_fields = {52303728 => "full_standby_version",
+				    52303748 => "operating_system"}
 
 # To avoid :exception=>#<RuntimeError: LogStash::Inputs::Zendesk#register must be overidden> 
   public
@@ -96,7 +98,6 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   private
   def get_tickets(queue, start_time)
     begin
-      get_ticket_fields
       @logger.info("Processing tickets...")
 
       end_of_stream = false
@@ -153,14 +154,14 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
   def process_ticket(queue, ticket)
     begin
       event = LogStash::Event.new()
+      event.set("type", "ticket")
       ticket.attributes.each do |k,v|
-        # Zendesk incremental export api returns unfriendly field names for ticket fields (eg. field_<num>).
-        # This performs conversion back to the right types based on Zendesk field naming conventions
-        # and pulls in actual field names from ticket fields.  And also performs other type conversions.
-	puts "#{k}, #{v}"
+	if @@include_attributes.include?(k)
+	  event.set(k, v)
+	elsif k == "custom_fields"
+	  event.set(k, v)
+	end
       end # end ticket fields
-      event["type"] = "ticket"
-      event["id"] = ticket.id
       #if get_comments
       #  event["comments"] = get_ticket_comments(output_queue, ticket, @append_comments_to_tickets)
       #end
@@ -170,18 +171,6 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
       @logger.error(e.message, :method => "process_ticket", :trace => e.backtrace)
     end
   end # process ticket
-
-  private
-  def get_ticket_fields()
-    @ticketfields = Hash.new
-    ticket_fields = @zd_client.ticket_fields
-    ticket_fields.each do |tf|
-      @ticketfields["field_#{tf.id}"] = tf.title.downcase.gsub(' ', '_')
-      if @log_ticket_fields
-         @logger.info("Ticket field: " + tf.title.downcase.gsub(' ', '_'), :field_id => tf.id)
-      end
-    end
-  end # get_ticket_fields
 
   public
   def run(queue)

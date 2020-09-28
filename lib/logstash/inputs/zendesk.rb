@@ -101,6 +101,8 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
 
       end_of_stream = false
       page_count = 0
+      prev_ticket_tid = @last_ticket_id
+      prev_updated_at = @last_updated_at
       until end_of_stream # page loop
         tickets = ZendeskAPI::Ticket.incremental_export(@zd_client, start_time)
 	page_count += 1
@@ -111,12 +113,17 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
           if ticket.status == 'Deleted'
             # Do nothing, previously deleted tickets will show up in incremental export, but does not make sense to fetch
             @logger.info("      Skipping previously deleted ticket", :ticket_id => ticket.id)
-          else
+	  elsif (ticket.id == @last_ticket_id) and (ticket.updated_at == @last_updated_at)
+	    # Excluding duplicate items for time-based incremental exports (see API docs)
+	    @logger.info("      Excluding duplicate item, this ticke/update was processed in previous run", :ticket_id => ticket.id, :updated_at => ticket.updated_at)
+	  else
             count = count + 1
             @logger.info("      Ticket", :id => ticket.id, :progress => "#{count}/#{tickets.count}")
-            #process_ticket(output_queue,ticket,get_comments)
+            process_ticket(queue,ticket)
             @logger.info("      Done processing ticket", :id => ticket.id)
           end #end Deleted status check
+	  @last_ticket_id = ticket.id
+	  @last_updated_at = ticket.updated_at
         end # end ticket loop
 
 	end_of_stream = tickets.included["end_of_stream"]
@@ -141,6 +148,28 @@ class LogStash::Inputs::Zendesk < LogStash::Inputs::Base
     end
     @logger.info("Done processing tickets. Start time saved for the next iteration = #{@fetch_end_time}")
   end # def get_tickets
+
+  private
+  def process_ticket(queue, ticket)
+    begin
+      event = LogStash::Event.new()
+      ticket.attributes.each do |k,v|
+        # Zendesk incremental export api returns unfriendly field names for ticket fields (eg. field_<num>).
+        # This performs conversion back to the right types based on Zendesk field naming conventions
+        # and pulls in actual field names from ticket fields.  And also performs other type conversions.
+	puts "#{k}, #{v}"
+      end # end ticket fields
+      event["type"] = "ticket"
+      event["id"] = ticket.id
+      #if get_comments
+      #  event["comments"] = get_ticket_comments(output_queue, ticket, @append_comments_to_tickets)
+      #end
+      decorate(event)
+      queue << event
+    rescue => e
+      @logger.error(e.message, :method => "process_ticket", :trace => e.backtrace)
+    end
+  end # process ticket
 
   private
   def get_ticket_fields()
